@@ -12,7 +12,7 @@ harness) stays identical across all generated test cases.
 Usage
 -----
     python3 fuzz_gen.py [-n NUM_CASES] [-o OUTPUT_DIR] [-s SEED]
-                        [--strategy {standard,varied_shift,arithmetic,multi_load,random}]
+                        [--strategy {standard,varied_shift,arithmetic,multi_load,random_loads,jump_replace,random}]
 
 Examples
 --------
@@ -27,6 +27,7 @@ Examples
 """
 
 import argparse
+import itertools
 import os
 import random
 import sys
@@ -198,6 +199,7 @@ def strategy_multi_load():
 
 # --- Strategy 5: random extra loads before encode -------------------------
 
+
 def strategy_random_loads(num_extra=None):
     """
     Insert one or more speculative loads from random temp registers (which may
@@ -226,6 +228,82 @@ def strategy_random_loads(num_extra=None):
     return instrs
 
 
+# --- Strategy 6: jump replacement -----------------------------------------
+
+# Conditional branch instructions available in RISC-V (rs1, rs2, offset form).
+# All six comparison variants are included so the fuzzer explores the full
+# range of branch-predictor behaviour during speculative execution.
+COND_BRANCHES = ["beq", "bne", "blt", "bge", "bltu", "bgeu"]
+
+# Jump flavours injected by strategy_jump_replace.
+JUMP_TYPES = ["cond_branch", "jal", "jalr"]
+
+
+def strategy_jump_replace(num_jumps=None):
+    """
+    Inject jump and branch instructions inside the transient execution block.
+
+    Three kinds of control-flow injection are chosen uniformly at random:
+
+    * **cond_branch** – a conditional branch whose outcome depends on the
+      (possibly dirty) secret byte in ``a4`` vs. a random temp register.
+      The branch skips over one arithmetic instruction, creating a nested
+      speculative path inside the outer misprediction window.
+
+    * **jal** – an unconditional short forward jump (``jal zero, <label>``)
+      that skips one arithmetic instruction.  The skipped instruction is
+      architecturally dead but may still be decoded speculatively, probing
+      the CPU's fetch-ahead behaviour.
+
+    * **jalr** – an indirect jump through a register loaded with ``la``.
+      This exercises the indirect-branch predictor (IBP / BTB) in addition
+      to the conditional branch predictor, widening the attack surface.
+
+    In all cases the core Spectre gadget (secret load + cache encode) is
+    preserved.  Labels start at 2 because label ``1`` is already used by the
+    outer bounds-check jump target in the fixed template.
+    """
+    if num_jumps is None:
+        num_jumps = random.randint(1, 4)
+
+    instrs = _secret_load()  # a4 = array1[idx]
+
+    # Labels start at 2; label 1 is taken by the outer bounds-check target.
+    labels = itertools.count(2)
+
+    for _ in range(num_jumps):
+        choice = random.choice(JUMP_TYPES)
+        lbl = next(labels)
+
+        if choice == "cond_branch":
+            # Branch over one arithmetic instruction; condition derived from
+            # the secret byte (a4) compared to a random (possibly stale) reg.
+            op = random.choice(COND_BRANCHES)
+            tmp = rand_temp()
+            instrs.append(f'"{op} a4, {tmp}, {lbl}f\\n\\t"')
+            instrs.append(rand_arith_rri(dst="a4", src="a4"))
+            instrs.append(f'"{lbl}:\\n\\t"')
+
+        elif choice == "jal":
+            # Unconditional forward jump; skipped instruction is
+            # architecturally dead but may still enter the speculative pipeline.
+            instrs.append(f'"jal zero, {lbl}f\\n\\t"')
+            instrs.append(rand_arith_rri(dst="a4", src="a4"))  # speculative dead code
+            instrs.append(f'"{lbl}:\\n\\t"')
+
+        else:  # jalr – indirect jump through a register
+            tmp = rand_temp()
+            instrs.append(f'"la {tmp}, {lbl}f\\n\\t"')
+            instrs.append(f'"jalr zero, {tmp}, 0\\n\\t"')
+            instrs.append(rand_arith_rri(dst="a4", src="a4"))  # speculative dead code
+            instrs.append(f'"{lbl}:\\n\\t"')
+
+    # Clamp secret to byte range and encode into the cache timing channel.
+    instrs.append('"andi a4, a4, 255\\n\\t"')
+    instrs += _cache_encode(shift=random.choice([4, 5, 6, 7]))
+    return instrs
+
+
 # ---------------------------------------------------------------------------
 # Strategy dispatcher
 # ---------------------------------------------------------------------------
@@ -236,6 +314,7 @@ STRATEGIES = {
     "arithmetic":  strategy_arithmetic,
     "multi_load":  strategy_multi_load,
     "random_loads": strategy_random_loads,
+    "jump_replace": strategy_jump_replace,
 }
 
 ALL_STRATEGIES = list(STRATEGIES.keys())

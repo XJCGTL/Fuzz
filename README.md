@@ -33,6 +33,7 @@ strategies:
 | `arithmetic` | Random arithmetic/logical transforms on the secret byte before encoding |
 | `multi_load` | Two dependent loads from `array1` before the cache-encode step |
 | `random_loads` | Extra speculative loads from random registers before the cache-encode |
+| `jump_replace` | Injects conditional branches, unconditional `jal`, and indirect `jalr` jumps inside the transient window to probe nested branch-predictor interaction |
 
 ## Usage
 
